@@ -1,0 +1,43 @@
+# AgroAI Bot v2.0 - Python Dependencies
+# Python 3.12.7
+
+# Telegram Bot
+python-telegram-bot==20.7
+python-telegram-bot[webhooks]==20.7
+
+# Async HTTP
+aiohttp==3.9.1
+aiofiles==23.2.1
+httpx==0.25.2
+
+# Image Processing
+Pillow==10.1.0
+numpy==1.26.2
+
+# Satellite Data (Planetary Computer - БЕЗ API КЛЮЧА!)
+planetary-computer==1.0.0
+pystac-client==0.7.5
+pystac==1.9.0
+
+# AI (для ТОЧНОГО распознавания растений - РЕКОМЕНДУЕТСЯ!)
+anthropic==0.8.1
+
+# Database
+# sqlite3 встроено в Python
+
+# Configuration
+python-dotenv==1.0.0
+
+# Utilities
+requests==2.31.0
+python-dateutil==2.8.2
+
+# Logging
+colorlog==6.8.0
+
+# Validation
+pydantic==2.5.2
+
+# Testing
+pytest==7.4.3
+pytest-asyncio==0.21.1
