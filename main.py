@@ -17,7 +17,7 @@ import logging
 from datetime import datetime
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
-from config import BOT_TOKEN, ANTHROPIC_API_KEY
+from config import BOT_TOKEN, ANTHROPIC_API_KEY, SATELLITE_API_KEY
 from modules.crop_analyzer import CropAnalyzer
 from modules.ai_advisor import AIAdvisor
 from modules.credit_analyzer import CreditAnalyzer

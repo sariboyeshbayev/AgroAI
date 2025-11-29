@@ -28,10 +28,10 @@ SATELLITE_API_KEY = os.getenv("SATELLITE_API_KEY")
 # 4) Проверка ключей
 # =====================================
 if not BOT_TOKEN:
-    raise ValueError("❌ BOT_TOKEN не найден в .env файле!")
+    raise ValueError("❌ BOT_TOKEN не найден! Добавь его в Render → Environment Variables.")
 
 if not ANTHROPIC_API_KEY:
-    print("⚠️ ANTHROPIC_API_KEY не найден — Claude работать не будет!")
+    raise ValueError("❌ ANTHROPIC_API_KEY не найден! Добавь его в Render → Environment Variables.")
 else:
     print(f"✅ ANTHROPIC_API_KEY настроен: {ANTHROPIC_API_KEY[:15]}...")
 
