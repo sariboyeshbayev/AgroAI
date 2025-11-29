@@ -304,8 +304,14 @@ class AgroAIBot:
             import traceback
             traceback.print_exc()
 
-            await msg.edit_text(
-                self.get_text(user_id, 'error') + f"\n\n{str(e)[:100]}"
+            try:
+                await msg.delete()
+            except:
+                pass
+
+            await update.message.reply_text(
+                self.get_text(user_id, 'error') + f"\n\n{str(e)[:100]}",
+                reply_markup=self.get_main_keyboard(user_id)
             )
 
     # ═══════════════════════════════════════════════════════════════
@@ -407,6 +413,12 @@ class AgroAIBot:
             logger.error(f"[NDVI] Error: {e}")
             import traceback
             traceback.print_exc()
+
+            try:
+                if 'msg' in locals():
+                    await msg.delete()
+            except:
+                pass
 
             await update.message.reply_text(
                 self.get_text(user_id, 'error'),
