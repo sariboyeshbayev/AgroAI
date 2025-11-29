@@ -2,10 +2,9 @@ import os
 from dotenv import load_dotenv
 from pathlib import Path
 
-# =====================================
-# 1) Загружаем .env файл
-# =====================================
-load_dotenv()
+if os.path.isfile(".env"):
+
+    load_dotenv()
 
 # =====================================
 # 2) Директории
