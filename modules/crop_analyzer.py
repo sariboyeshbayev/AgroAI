@@ -104,11 +104,12 @@ class CropAnalyzer:
             prompt = self._get_plant_analysis_prompt(lang)
 
             # Вызов Claude Vision
+            # Вызов Claude Vision
             client = AsyncAnthropic(api_key=self.api_key)
 
             response = await client.messages.create(
                 model="claude-sonnet-4-20250514",
-                max_tokens=2500,
+                max_tokens=1500,
                 temperature=0.3,
                 messages=[{
                     "role": "user",
@@ -125,7 +126,6 @@ class CropAnalyzer:
                     ]
                 }]
             )
-
             # Парсинг ответа
             text = response.content[0].text.strip()
 
@@ -299,11 +299,14 @@ Batafsil va amaliy maslahatlar bering!"""
             search = self.stac.search(
                 collections=["sentinel-2-l2a"],
                 intersects={"type": "Point", "coordinates": [lon, lat]},
-                limit=1
+                datetime="2024-11-01/2025-11-30",  # Последние месяцы
+                limit=5,
+                sortby="-properties.datetime"  # Сортировка по дате (новые первые)
             )
 
             items = list(search.items())
             if not items:
+                logger.warning("No Sentinel-2 data found for location")
                 return {
                     'ndvi_value': 0.0,
                     'status': 'no_data',
@@ -311,61 +314,109 @@ Batafsil va amaliy maslahatlar bering!"""
                     'date': None
                 }
 
-            item = items[0]
-            date = item.properties["datetime"][:10]
+            # Пробуем несколько снимков (иногда первый битый)
+            for item in items[:3]:
+                try:
+                    date = item.properties["datetime"][:10]
+                    logger.info(f"Trying NDVI for date: {date}")
 
-            # Получение NIR (B08) и RED (B04) bands
-            nir_url = planetary_computer.sign(item.assets["B08"].href)
-            red_url = planetary_computer.sign(item.assets["B04"].href)
+                    # Получение NIR (B08) и RED (B04) bands с подписью
+                    nir_href = item.assets["B08"].href
+                    red_href = item.assets["B04"].href
 
-            # Загрузка данных
-            async with httpx.AsyncClient(timeout=60) as client:
-                nir_response, red_response = await asyncio.gather(
-                    client.get(nir_url),
-                    client.get(red_url)
-                )
+                    # Подписываем URL через Planetary Computer
+                    nir_url = planetary_computer.sign(nir_href)
+                    red_url = planetary_computer.sign(red_href)
 
-            # Вычисление NDVI
-            nir = np.array(Image.open(BytesIO(nir_response.content)))
-            red = np.array(Image.open(BytesIO(red_response.content)))
+                    logger.info(f"Downloading NIR and RED bands...")
 
-            ndvi = (nir - red) / (nir + red + 1e-6)
-            ndvi = np.clip(ndvi, -1, 1)
+                    # Загрузка данных с увеличенным таймаутом
+                    async with httpx.AsyncClient(timeout=120) as client:
+                        try:
+                            nir_response = await client.get(nir_url)
+                            nir_response.raise_for_status()
 
-            mean_ndvi = float(ndvi.mean())
+                            red_response = await client.get(red_url)
+                            red_response.raise_for_status()
+                        except httpx.HTTPStatusError as e:
+                            logger.warning(f"HTTP error for date {date}: {e}")
+                            continue  # Пробуем следующий снимок
 
-            # Интерпретация
-            if mean_ndvi > 0.6:
-                status_key = "ndvi_excellent"
-                status = "excellent"
-            elif mean_ndvi > 0.4:
-                status_key = "ndvi_good"
-                status = "good"
-            elif mean_ndvi > 0.2:
-                status_key = "ndvi_medium"
-                status = "medium"
-            else:
-                status_key = "ndvi_bad"
-                status = "bad"
+                    # Вычисление NDVI
+                    try:
+                        nir = np.array(Image.open(BytesIO(nir_response.content)).convert('L'), dtype=np.float32)
+                        red = np.array(Image.open(BytesIO(red_response.content)).convert('L'), dtype=np.float32)
+                    except Exception as img_err:
+                        logger.warning(f"Image processing error for {date}: {img_err}")
+                        continue
 
-            summary = f"""📅 **Sana / Дата:** {date}
-📊 **NDVI:** {mean_ndvi:.3f}
-{MESSAGES[status_key][lang]}"""
+                    # Уменьшаем размер для ускорения
+                    if nir.shape[0] > 1000:
+                        from PIL import Image as PILImage
+                        nir_img = PILImage.fromarray(nir).resize((500, 500))
+                        red_img = PILImage.fromarray(red).resize((500, 500))
+                        nir = np.array(nir_img, dtype=np.float32)
+                        red = np.array(red_img, dtype=np.float32)
 
-            logger.info(f"✅ NDVI calculated: {mean_ndvi:.3f} ({status})")
+                    # NDVI формула
+                    ndvi = (nir - red) / (nir + red + 1e-6)
+                    ndvi = np.clip(ndvi, -1, 1)
 
+                    # Фильтрация аномалий (вода, облака)
+                    valid_mask = (ndvi > -0.5) & (ndvi < 1.0)
+                    if valid_mask.sum() == 0:
+                        logger.warning(f"No valid NDVI data for {date}")
+                        continue
+
+                    mean_ndvi = float(ndvi[valid_mask].mean())
+
+                    # Интерпретация
+                    if mean_ndvi > 0.6:
+                        status_key = "ndvi_excellent"
+                        status = "excellent"
+                    elif mean_ndvi > 0.4:
+                        status_key = "ndvi_good"
+                        status = "good"
+                    elif mean_ndvi > 0.2:
+                        status_key = "ndvi_medium"
+                        status = "medium"
+                    else:
+                        status_key = "ndvi_bad"
+                        status = "bad"
+
+                    summary = f"""📅 **Sana / Дата:** {date}
+    📊 **NDVI:** {mean_ndvi:.3f}
+    {MESSAGES[status_key][lang]}"""
+
+                    logger.info(f"✅ NDVI calculated: {mean_ndvi:.3f} ({status}) for {date}")
+
+                    return {
+                        'ndvi_value': mean_ndvi,
+                        'status': status,
+                        'summary': summary,
+                        'date': date,
+                        'min': float(ndvi[valid_mask].min()),
+                        'max': float(ndvi[valid_mask].max()),
+                        'std': float(ndvi[valid_mask].std())
+                    }
+
+                except Exception as e:
+                    logger.warning(f"Error processing item for {date}: {e}")
+                    continue  # Пробуем следующий снимок
+
+            # Если все снимки не сработали
+            logger.error("All Sentinel-2 items failed")
             return {
-                'ndvi_value': mean_ndvi,
-                'status': status,
-                'summary': summary,
-                'date': date,
-                'min': float(ndvi.min()),
-                'max': float(ndvi.max()),
-                'std': float(ndvi.std())
+                'ndvi_value': 0.0,
+                'status': 'error',
+                'summary': MESSAGES['no_data'][lang],
+                'date': None
             }
 
         except Exception as e:
             logger.error(f"❌ NDVI error: {e}")
+            import traceback
+            traceback.print_exc()
             return {
                 'ndvi_value': 0.0,
                 'status': 'error',
