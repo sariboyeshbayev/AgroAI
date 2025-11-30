@@ -13,6 +13,63 @@ class Database:
     def __init__(self):
         self.db_path = DATABASE_PATH
         self.init_database()
+        self._auto_migrate()  # Автоматическая миграция
+
+    def _auto_migrate(self):
+        """Автоматическое добавление недостающих колонок"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        try:
+            # Миграция для plant_analyses
+            cursor.execute("PRAGMA table_info(plant_analyses)")
+            existing_plant = {row[1] for row in cursor.fetchall()}
+
+            plant_cols = {
+                'plant_type': 'TEXT',
+                'plant_type_en': 'TEXT',
+                'confidence': 'INTEGER',
+                'health_status': 'TEXT',
+                'health_score': 'INTEGER',
+                'disease_name': 'TEXT',
+                'disease_name_en': 'TEXT',
+                'symptoms': 'TEXT',
+                'causes': 'TEXT',
+                'treatment': 'TEXT',
+                'fertilizer': 'TEXT',
+                'watering': 'TEXT',
+                'prevention': 'TEXT',
+                'recovery_time': 'TEXT'
+            }
+
+            for col, typ in plant_cols.items():
+                if col not in existing_plant:
+                    cursor.execute(f"ALTER TABLE plant_analyses ADD COLUMN {col} {typ}")
+                    logger.info(f"✅ Добавлена колонка plant_analyses.{col}")
+
+            # Миграция для ndvi_analyses
+            cursor.execute("PRAGMA table_info(ndvi_analyses)")
+            existing_ndvi = {row[1] for row in cursor.fetchall()}
+
+            ndvi_cols = {
+                'ndvi_status': 'TEXT',
+                'ndvi_min': 'REAL',
+                'ndvi_max': 'REAL',
+                'ndvi_std': 'REAL'
+            }
+
+            for col, typ in ndvi_cols.items():
+                if col not in existing_ndvi:
+                    cursor.execute(f"ALTER TABLE ndvi_analyses ADD COLUMN {col} {typ}")
+                    logger.info(f"✅ Добавлена колонка ndvi_analyses.{col}")
+
+            conn.commit()
+            logger.info("✅ Миграция БД завершена")
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка миграции БД: {e}")
+        finally:
+            conn.close()
 
     def get_connection(self):
         """Создать подключение к БД"""
