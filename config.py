@@ -31,7 +31,7 @@ if not BOT_TOKEN:
 
 if not ANTHROPIC_API_KEY:
     raise ValueError("❌ ANTHROPIC_API_KEY не найден! Добавь его в Render → Environment Variables.")
-
+else:
     print(f"✅ ANTHROPIC_API_KEY настроен: {ANTHROPIC_API_KEY[:15]}...")
 
 # =====================================
