@@ -20,7 +20,7 @@ pystac-client==0.7.5
 pystac==1.9.0
 
 # AI (для ТОЧНОГО распознавания растений - РЕКОМЕНДУЕТСЯ!)
-anthropic==0.8.1
+anthropic==0.39.0
 
 # Database
 # sqlite3 встроено в Python
