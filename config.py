@@ -21,6 +21,8 @@ LOGS_DIR.mkdir(exist_ok=True)
 # =====================================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+SENTINEL_CLIENT_ID = os.getenv("SENTINEL_CLIENT_ID")
+SENTINEL_CLIENT_SECRET = os.getenv("SENTINEL_CLIENT_SECRET")
 SATELLITE_API_KEY = os.getenv("SATELLITE_API_KEY")
 
 # =====================================
@@ -33,6 +35,11 @@ if not ANTHROPIC_API_KEY:
     raise ValueError("❌ ANTHROPIC_API_KEY не найден! Добавь его в Render → Environment Variables.")
 else:
     print(f"✅ ANTHROPIC_API_KEY настроен: {ANTHROPIC_API_KEY[:15]}...")
+
+if not SENTINEL_CLIENT_ID or not SENTINEL_CLIENT_SECRET:
+    print("⚠️ SENTINEL credentials не найдены. NDVI будет работать в демо-режиме.")
+else:
+    print(f"✅ Sentinel Hub настроен: {SENTINEL_CLIENT_ID[:15]}...")
 
 # =====================================
 # 5) Конфигурации

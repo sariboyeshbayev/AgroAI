@@ -1,9 +1,9 @@
 """
 Crop Analyzer - Модуль анализа растений и NDVI
-Версия 3.0 - Разделенная логика
+Версия 3.1 - Интеграция с Sentinel Hub API
 
 1. analyze_plant_only() - ТОЛЬКО фото → Claude Vision
-2. analyze_ndvi_only() - ТОЛЬКО координаты → Satellite
+2. analyze_ndvi_only() - ТОЛЬКО координаты → Sentinel Hub → Planetary Computer (fallback)
 3. generate_ndvi_advice() - NDVI данные → Claude AI советы
 """
 import numpy as np
@@ -17,8 +17,9 @@ import asyncio
 import base64
 import json
 from typing import Dict, Optional
+from datetime import datetime, timedelta
 from anthropic import AsyncAnthropic
-from config import ANTHROPIC_API_KEY
+from config import ANTHROPIC_API_KEY, SENTINEL_CLIENT_ID, SENTINEL_CLIENT_SECRET
 
 logger = logging.getLogger(__name__)
 
@@ -50,15 +51,250 @@ MESSAGES = {
 }
 
 
+# ═══════════════════════════════════════════════════════════════
+# SENTINEL HUB NDVI КЛАСС
+# ═══════════════════════════════════════════════════════════════
+
+class SentinelNDVI:
+    """Работа с реальными спутниковыми данными Sentinel Hub"""
+
+    BASE_URL = "https://services.sentinel-hub.com"
+
+    def __init__(self, client_id: str, client_secret: str):
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self._token = None
+        self._token_expires = None
+
+    async def get_access_token(self) -> Optional[str]:
+        """Получение OAuth токена с кешированием"""
+        # Проверка кеша
+        if self._token and self._token_expires and datetime.now() < self._token_expires:
+            return self._token
+
+        url = f"{self.BASE_URL}/oauth/token"
+        data = {
+            'grant_type': 'client_credentials',
+            'client_id': self.client_id,
+            'client_secret': self.client_secret
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.post(url, data=data)
+                response.raise_for_status()
+
+                result = response.json()
+                self._token = result['access_token']
+                # Токен действует 1 час, ставим 50 минут для безопасности
+                self._token_expires = datetime.now() + timedelta(minutes=50)
+
+                logger.info("✅ Sentinel Hub token obtained")
+                return self._token
+
+        except Exception as e:
+            logger.error(f"❌ Token error: {e}")
+            return None
+
+    async def get_ndvi(self, lat: float, lon: float, days: int = 30) -> Dict:
+        """
+        Получение реального NDVI со спутника Sentinel-2
+
+        Args:
+            lat: широта
+            lon: долгота
+            days: период поиска снимков (по умолчанию 30 дней)
+
+        Returns:
+            Dict с NDVI данными или ошибкой
+        """
+        token = await self.get_access_token()
+        if not token:
+            return {'success': False, 'error': 'Не удалось авторизоваться'}
+
+        # Создаем bbox 1x1 км вокруг точки
+        offset = 0.0045  # ~500 метров
+        bbox = [
+            lon - offset, lat - offset,
+            lon + offset, lat + offset
+        ]
+
+        # Временной диапазон
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=days)
+
+        logger.info(f"🛰️ Requesting Sentinel-2 data: {start_date.date()} to {end_date.date()}")
+
+        # Получение статистики через Statistical API
+        stats = await self._get_statistics(bbox, start_date, end_date, token)
+
+        if stats:
+            return {
+                'success': True,
+                'ndvi_value': stats['mean'],
+                'min': stats['min'],
+                'max': stats['max'],
+                'std': stats['stdev'],
+                'date': stats['date'],
+                'status': self._interpret_ndvi(stats['mean'])
+            }
+        else:
+            # Если нет данных, пробуем расширить период
+            if days < 90:
+                logger.warning(f"No data for {days} days, trying {days * 2}")
+                return await self.get_ndvi(lat, lon, days=min(days * 2, 90))
+
+            return {
+                'success': False,
+                'error': f'Нет снимков за последние {days} дней'
+            }
+
+    async def _get_statistics(self, bbox: list, start_date: datetime,
+                              end_date: datetime, token: str) -> Optional[Dict]:
+        """Получение статистики NDVI через Statistical API"""
+
+        url = f"{self.BASE_URL}/api/v1/statistics"
+        headers = {
+            'Authorization': f'Bearer {token}',
+            'Content-Type': 'application/json'
+        }
+
+        evalscript = """
+        //VERSION=3
+        function setup() {
+            return {
+                input: [{
+                    bands: ["B04", "B08", "SCL"]
+                }],
+                output: [{
+                    id: "ndvi",
+                    bands: 1
+                }]
+            };
+        }
+
+        function evaluatePixel(sample) {
+            // Фильтрация облаков, теней, снега
+            if (sample.SCL == 3 || sample.SCL == 8 || sample.SCL == 9 || 
+                sample.SCL == 10 || sample.SCL == 11) {
+                return [null];
+            }
+
+            let ndvi = (sample.B08 - sample.B04) / (sample.B08 + sample.B04);
+            return [ndvi];
+        }
+        """
+
+        payload = {
+            "input": {
+                "bounds": {
+                    "bbox": bbox,
+                    "properties": {
+                        "crs": "http://www.opengis.net/def/crs/EPSG/0/4326"
+                    }
+                },
+                "data": [{
+                    "type": "sentinel-2-l2a",
+                    "dataFilter": {
+                        "timeRange": {
+                            "from": start_date.strftime('%Y-%m-%dT00:00:00Z'),
+                            "to": end_date.strftime('%Y-%m-%dT23:59:59Z')
+                        },
+                        "maxCloudCoverage": 30
+                    }
+                }]
+            },
+            "aggregation": {
+                "timeRange": {
+                    "from": start_date.strftime('%Y-%m-%dT00:00:00Z'),
+                    "to": end_date.strftime('%Y-%m-%dT23:59:59Z')
+                },
+                "aggregationInterval": {
+                    "of": "P1D"
+                },
+                "evalscript": evalscript,
+                "resx": 10,
+                "resy": 10
+            },
+            "calculations": {
+                "ndvi": {
+                    "statistics": {
+                        "default": {
+                            "percentiles": {
+                                "k": [25, 50, 75]
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                response = await client.post(url, headers=headers, json=payload)
+                response.raise_for_status()
+
+                data = response.json()
+
+                # Берем последний доступный снимок
+                if data.get('data') and len(data['data']) > 0:
+                    latest = data['data'][-1]
+                    outputs = latest.get('outputs', {}).get('ndvi', {})
+                    bands = outputs.get('bands', {}).get('B0', {})
+                    stats = bands.get('stats', {})
+
+                    if stats.get('mean') is not None:
+                        logger.info(f"✅ Sentinel Hub stats: mean={stats['mean']:.3f}")
+                        return {
+                            'mean': float(stats['mean']),
+                            'min': float(stats.get('min', 0)),
+                            'max': float(stats.get('max', 1)),
+                            'stdev': float(stats.get('stDev', 0)),
+                            'date': latest['interval']['from'][:10]
+                        }
+
+                return None
+
+        except httpx.HTTPStatusError as e:
+            logger.error(f"❌ HTTP {e.response.status_code}: {e.response.text[:200]}")
+            return None
+        except Exception as e:
+            logger.error(f"❌ Statistics error: {e}")
+            return None
+
+    def _interpret_ndvi(self, ndvi: float) -> str:
+        """Интерпретация значения NDVI"""
+        if ndvi >= 0.6:
+            return 'excellent'
+        elif ndvi >= 0.4:
+            return 'good'
+        elif ndvi >= 0.2:
+            return 'medium'
+        else:
+            return 'bad'
+
+
+# ═══════════════════════════════════════════════════════════════
+# ОСНОВНОЙ КЛАСС CROP ANALYZER
+# ═══════════════════════════════════════════════════════════════
+
 class CropAnalyzer:
     def __init__(self, api_key: str):
         """Инициализация"""
         self.api_key = api_key
 
-        # Planetary Computer STAC
+        # Инициализация Sentinel Hub (приоритет)
+        if SENTINEL_CLIENT_ID and SENTINEL_CLIENT_SECRET:
+            self.sentinel = SentinelNDVI(SENTINEL_CLIENT_ID, SENTINEL_CLIENT_SECRET)
+            logger.info("✅ Sentinel Hub NDVI initialized")
+        else:
+            self.sentinel = None
+            logger.warning("⚠️ Sentinel Hub не настроен (используем Planetary Computer)")
+
+        # Planetary Computer STAC как резервный вариант
         try:
             self.stac = Client.open("https://planetarycomputer.microsoft.com/api/stac/v1")
-            logger.info("✅ Planetary Computer initialized")
+            logger.info("✅ Planetary Computer initialized (fallback)")
         except Exception as e:
             logger.error(f"❌ STAC init error: {e}")
             self.stac = None
@@ -104,7 +340,6 @@ class CropAnalyzer:
             prompt = self._get_plant_analysis_prompt(lang)
 
             # Вызов Claude Vision
-            # Вызов Claude Vision
             client = AsyncAnthropic(api_key=self.api_key)
 
             response = await client.messages.create(
@@ -126,6 +361,7 @@ class CropAnalyzer:
                     ]
                 }]
             )
+
             # Парсинг ответа
             text = response.content[0].text.strip()
 
@@ -278,14 +514,57 @@ Batafsil va amaliy maslahatlar bering!"""
         }
 
     # ═══════════════════════════════════════════════════════════════
-    # 2️⃣ NDVI АНАЛИЗ (ТОЛЬКО СПУТНИК)
+    # 2️⃣ NDVI АНАЛИЗ (СНАЧАЛА SENTINEL HUB, ПОТОМ PLANETARY COMPUTER)
     # ═══════════════════════════════════════════════════════════════
 
     async def analyze_ndvi_only(self, lat: float, lon: float, lang: str) -> Dict:
         """
         Получение NDVI данных со спутника
-        Возвращает: NDVI значение + интерпретация
+        Приоритет: Sentinel Hub → Planetary Computer → демо
         """
+
+        # ПОПЫТКА 1: Sentinel Hub (РЕАЛЬНЫЕ СВЕЖИЕ ДАННЫЕ)
+        if self.sentinel:
+            logger.info(f"🛰️ Trying Sentinel Hub for {lat:.4f}, {lon:.4f}")
+            result = await self.sentinel.get_ndvi(lat, lon)
+
+            if result['success']:
+                ndvi = result['ndvi_value']
+                status = result['status']
+
+                # Интерпретация
+                if status == 'excellent':
+                    status_key = "ndvi_excellent"
+                elif status == 'good':
+                    status_key = "ndvi_good"
+                elif status == 'medium':
+                    status_key = "ndvi_medium"
+                else:
+                    status_key = "ndvi_bad"
+
+                summary = f"""📅 **Sana / Дата:** {result['date']}
+📊 **NDVI:** {ndvi:.3f}
+{MESSAGES[status_key][lang]}
+
+📈 **Min:** {result['min']:.3f} | **Max:** {result['max']:.3f}"""
+
+                logger.info(f"✅ Sentinel Hub NDVI: {ndvi:.3f} ({status})")
+
+                return {
+                    'ndvi_value': ndvi,
+                    'status': status,
+                    'summary': summary,
+                    'date': result['date'],
+                    'min': result['min'],
+                    'max': result['max'],
+                    'std': result['std']
+                }
+            else:
+                logger.warning(f"⚠️ Sentinel Hub failed: {result['error']}")
+
+        # ПОПЫТКА 2: Planetary Computer (РЕЗЕРВ)
+        logger.info(f"🛰️ Trying Planetary Computer for {lat:.4f}, {lon:.4f}")
+
         if not self.stac:
             return {
                 'ndvi_value': 0.0,
@@ -299,14 +578,14 @@ Batafsil va amaliy maslahatlar bering!"""
             search = self.stac.search(
                 collections=["sentinel-2-l2a"],
                 intersects={"type": "Point", "coordinates": [lon, lat]},
-                datetime="2024-11-01/2025-11-30",  # Последние месяцы
+                datetime="2024-11-01/2025-12-31",
                 limit=5,
-                sortby="-properties.datetime"  # Сортировка по дате (новые первые)
+                sortby="-properties.datetime"
             )
 
             items = list(search.items())
             if not items:
-                logger.warning("No Sentinel-2 data found for location")
+                logger.warning("No Sentinel-2 data found")
                 return {
                     'ndvi_value': 0.0,
                     'status': 'no_data',
@@ -314,23 +593,23 @@ Batafsil va amaliy maslahatlar bering!"""
                     'date': None
                 }
 
-            # Пробуем несколько снимков (иногда первый битый)
+            # Пробуем несколько снимков
             for item in items[:3]:
                 try:
                     date = item.properties["datetime"][:10]
                     logger.info(f"Trying NDVI for date: {date}")
 
-                    # Получение NIR (B08) и RED (B04) bands с подписью
+                    # Получение NIR (B08) и RED (B04) bands
                     nir_href = item.assets["B08"].href
                     red_href = item.assets["B04"].href
 
-                    # Подписываем URL через Planetary Computer
+                    # Подписываем URL
                     nir_url = planetary_computer.sign(nir_href)
                     red_url = planetary_computer.sign(red_href)
 
-                    logger.info(f"Downloading NIR and RED bands...")
+                    logger.info(f"Downloading bands...")
 
-                    # Загрузка данных с увеличенным таймаутом
+                    # Загрузка данных
                     async with httpx.AsyncClient(timeout=120) as client:
                         try:
                             nir_response = await client.get(nir_url)
@@ -339,18 +618,18 @@ Batafsil va amaliy maslahatlar bering!"""
                             red_response = await client.get(red_url)
                             red_response.raise_for_status()
                         except httpx.HTTPStatusError as e:
-                            logger.warning(f"HTTP error for date {date}: {e}")
-                            continue  # Пробуем следующий снимок
+                            logger.warning(f"HTTP error for {date}: {e}")
+                            continue
 
                     # Вычисление NDVI
                     try:
                         nir = np.array(Image.open(BytesIO(nir_response.content)).convert('L'), dtype=np.float32)
                         red = np.array(Image.open(BytesIO(red_response.content)).convert('L'), dtype=np.float32)
                     except Exception as img_err:
-                        logger.warning(f"Image processing error for {date}: {img_err}")
+                        logger.warning(f"Image error for {date}: {img_err}")
                         continue
 
-                    # Уменьшаем размер для ускорения
+                    # Уменьшаем размер
                     if nir.shape[0] > 1000:
                         from PIL import Image as PILImage
                         nir_img = PILImage.fromarray(nir).resize((500, 500))
@@ -362,10 +641,10 @@ Batafsil va amaliy maslahatlar bering!"""
                     ndvi = (nir - red) / (nir + red + 1e-6)
                     ndvi = np.clip(ndvi, -1, 1)
 
-                    # Фильтрация аномалий (вода, облака)
+                    # Фильтрация
                     valid_mask = (ndvi > -0.5) & (ndvi < 1.0)
                     if valid_mask.sum() == 0:
-                        logger.warning(f"No valid NDVI data for {date}")
+                        logger.warning(f"No valid NDVI for {date}")
                         continue
 
                     mean_ndvi = float(ndvi[valid_mask].mean())
@@ -385,10 +664,10 @@ Batafsil va amaliy maslahatlar bering!"""
                         status = "bad"
 
                     summary = f"""📅 **Sana / Дата:** {date}
-    📊 **NDVI:** {mean_ndvi:.3f}
-    {MESSAGES[status_key][lang]}"""
+📊 **NDVI:** {mean_ndvi:.3f}
+{MESSAGES[status_key][lang]}"""
 
-                    logger.info(f"✅ NDVI calculated: {mean_ndvi:.3f} ({status}) for {date}")
+                    logger.info(f"✅ Planetary Computer NDVI: {mean_ndvi:.3f} ({status})")
 
                     return {
                         'ndvi_value': mean_ndvi,
@@ -401,11 +680,11 @@ Batafsil va amaliy maslahatlar bering!"""
                     }
 
                 except Exception as e:
-                    logger.warning(f"Error processing item for {date}: {e}")
-                    continue  # Пробуем следующий снимок
+                    logger.warning(f"Error for {date}: {e}")
+                    continue
 
-            # Если все снимки не сработали
-            logger.error("All Sentinel-2 items failed")
+            # Все снимки не сработали
+            logger.error("All items failed")
             return {
                 'ndvi_value': 0.0,
                 'status': 'error',
