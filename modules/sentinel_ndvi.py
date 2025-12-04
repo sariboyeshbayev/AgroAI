@@ -1,377 +1,249 @@
 """
-Sentinel NDVI module — robust async implementation
-Version: 1.1 (improved error handling, token/session reuse, robust parsing)
+Исправленный модуль для запроса NDVI через Sentinel Hub Process API.
+Основные правки:
+ - Правильная генерация bbox (не точка)
+ - Корректная структура запроса (payload) и evalscript
+ - Получение токена OAuth и повторное использование при необходимости
+ - Подробное логирование ошибок 400/прочих
+ - Возвращает numpy array NDVI или None при ошибке
+
+Зависимости: httpx, numpy, rasterio (только если нужно читать GeoTIFF), typing, datetime
 """
-import httpx
-import asyncio
-from typing import Dict, Optional, List
-from datetime import datetime, timedelta
 import logging
 import math
+from datetime import datetime, timedelta
+from typing import Optional, Tuple, Dict, Any
+
+import httpx
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
-try:
-    import numpy as np
-except Exception:
-    np = None
-    logger.warning("numpy not available — local statistics calculation will be limited.")
+
+class SentinelHubError(Exception):
+    pass
 
 
 class SentinelNDVI:
     BASE_URL = "https://services.sentinel-hub.com"
+    OAUTH_URL = BASE_URL + "/oauth/token"
+    PROCESS_URL = BASE_URL + "/api/v1/process"
 
-    def __init__(self, client_id: str, client_secret: str, *, session: Optional[httpx.AsyncClient] = None):
+    def __init__(self, client_id: str, client_secret: str, instance_id: Optional[str] = None, timeout: int = 30):
+        """
+        :param client_id: OAuth client id (Sentinel Hub application)
+        :param client_secret: OAuth client secret
+        :param instance_id: optional custom instance id (if using sentinel-hub instance-based requests)
+        :param timeout: HTTP timeout seconds
+        """
         self.client_id = client_id
         self.client_secret = client_secret
-        self._token: Optional[str] = None
-        self._token_expires: Optional[datetime] = None
-        self._session_provided = session is not None
-        self._session = session or httpx.AsyncClient(timeout=60)
-        # Limits
-        self._max_days = 90
-        self._max_attempts = 4
+        self.instance_id = instance_id
+        self.timeout = timeout
+        self._token: Optional[Dict[str, Any]] = None
+        self._token_expires_at: Optional[datetime] = None
+        self._http = httpx.Client(timeout=self.timeout)
 
-    async def close(self):
-        if not self._session_provided:
-            await self._session.aclose()
+    def close(self) -> None:
+        try:
+            self._http.close()
+        except Exception:
+            pass
 
-    async def get_access_token(self) -> Optional[str]:
-        """Get OAuth token with caching (50 minutes validity window)."""
-        if self._token and self._token_expires and datetime.utcnow() < self._token_expires:
-            return self._token
+    def _get_oauth_token(self) -> str:
+        """Получить (или переиспользовать) OAuth токен от Sentinel Hub.
+        Сохраняем expiry и повторно используем токен, пока он действителен.
+        """
+        if self._token and self._token_expires_at and datetime.utcnow() < self._token_expires_at - timedelta(seconds=10):
+            return self._token.get("access_token")
 
-        url = f"{self.BASE_URL}/oauth/token"
-        data = {
-            'grant_type': 'client_credentials',
-            'client_id': self.client_id,
-            'client_secret': self.client_secret
+        payload = {
+            "grant_type": "client_credentials",
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
         }
 
         try:
-            resp = await self._session.post(url, data=data)
-            resp.raise_for_status()
-            result = resp.json()
-            self._token = result.get('access_token')
-            # token lifetime often 1 hour -> keep 50 minutes window
-            self._token_expires = datetime.utcnow() + timedelta(minutes=50)
-            logger.info("Sentinel Hub token obtained.")
-            return self._token
-        except httpx.HTTPStatusError as e:
-            logger.error("Token request failed: %s %s", e.response.status_code, e.response.text)
-            return None
+            r = self._http.post(self.OAUTH_URL, data=payload)
         except Exception as e:
-            logger.error("Token error: %s", e)
-            return None
+            logger.exception("Ошибка при запросе OAuth токена")
+            raise SentinelHubError("OAuth request failed: %s" % e)
 
-    async def get_ndvi(self, lat: float, lon: float, days: int = 30, attempt: int = 1) -> Dict:
-        """
-        Get NDVI statistics for point (lat, lon).
-        - attempt: internal counter to limit recursive retries when no data.
-        """
-        if attempt > self._max_attempts:
-            return {'success': False, 'error': 'Max attempts reached'}
+        if r.status_code != 200:
+            logger.error("OAuth token endpoint returned status %s: %s", r.status_code, r.text)
+            raise SentinelHubError(f"OAuth token endpoint returned {r.status_code}: {r.text}")
 
-        token = await self.get_access_token()
+        j = r.json()
+        token = j.get("access_token")
+        expires_in = j.get("expires_in", 3600)
         if not token:
-            return {'success': False, 'error': 'Authorization failed'}
+            logger.error("OAuth response does not contain access_token: %s", j)
+            raise SentinelHubError("OAuth response missing access_token")
 
-        # bbox ~1x1 km (approx)
-        offset = 0.0045
-        bbox = [lon - offset, lat - offset, lon + offset, lat + offset]
+        self._token = j
+        self._token_expires_at = datetime.utcnow() + timedelta(seconds=int(expires_in))
+        logger.info("Sentinel Hub token obtained. Expires at %s", self._token_expires_at.isoformat())
+        return token
 
-        end_date = datetime.utcnow()
-        start_date = end_date - timedelta(days=min(days, self._max_days))
-
-        evalscript = """
-        //VERSION=3
-        function setup() {
-            return {
-                input: [{ bands: ["B04","B08","SCL"] }],
-                output: [{ id: "ndvi", bands: 1, sampleType: "FLOAT32" }, { id: "dataMask", bands: 1 }]
-            };
-        }
-        function evaluatePixel(sample) {
-            // mask cloud / invalid SCL values (example codes)
-            if (sample.SCL == 3 || sample.SCL == 8 || sample.SCL == 9 || sample.SCL == 10 || sample.SCL == 11) {
-                return { ndvi: [0.0], dataMask: [0] };
-            }
-            let denom = (sample.B08 + sample.B04);
-            if (denom == 0.0) {
-                return { ndvi: [0.0], dataMask: [0] };
-            }
-            let ndvi = (sample.B08 - sample.B04) / denom;
-            return { ndvi: [ndvi], dataMask: [1] };
-        }
+    @staticmethod
+    def _make_bbox(lon: float, lat: float, size_meters: float = 50.0) -> Tuple[float, float, float, float]:
+        """Сделать bbox вокруг точки (lon, lat) с приблизительным размером в метрах.
+        Для небольших delta используем приближение: 1 deg lat ~= 111320 m
+        1 deg lon ~= 111320 * cos(lat)
+        Возвращает [lon_min, lat_min, lon_max, lat_max]
         """
+        if size_meters <= 0:
+            raise ValueError("size_meters must be > 0")
 
-        process_url = f"{self.BASE_URL}/api/v1/process"
-        headers = {
-            'Authorization': f'Bearer {token}',
-            'Content-Type': 'application/json'
+        lat_deg_per_m = 1.0 / 111320.0
+        lon_deg_per_m = 1.0 / (111320.0 * math.cos(math.radians(lat)))
+
+        half_lat = (size_meters / 2.0) * lat_deg_per_m
+        half_lon = (size_meters / 2.0) * lon_deg_per_m
+
+        return (lon - half_lon, lat - half_lat, lon + half_lon, lat + half_lat)
+
+    @staticmethod
+    def _default_evalscript() -> str:
+        return """
+//VERSION=3
+function setup() {
+  return {
+    input: [
+      { bands: ["B04", "B08"], units: "REFLECTANCE" }
+    ],
+    output: { id: "ndvi", bands: 1, sampleType: "FLOAT32" }
+  };
+}
+
+function evaluatePixel(sample) {
+  let b4 = sample.B04;
+  let b8 = sample.B08;
+  let ndvi = (b8 - b4) / (b8 + b4);
+  if (!isFinite(ndvi)) {
+    ndvi = -1.0;
+  }
+  return [ndvi];
+}
+"""
+
+    def _build_payload(self, bbox: Tuple[float, float, float, float], from_date: str, to_date: str, evalscript: Optional[str] = None) -> Dict[str, Any]:
+        if not evalscript:
+            evalscript = self._default_evalscript()
+
+        data_source = {
+            "type": "SENTINEL2_L2A",
+            # дополнительные параметры можно вставить сюда при необходимости
         }
 
         payload = {
             "input": {
                 "bounds": {
-                    "bbox": bbox,
-                    "properties": {"crs": "EPSG:4326"}
+                    "bbox": [bbox[0], bbox[1], bbox[2], bbox[3]]
                 },
-                "data": [{
-                    "type": "sentinel-2-l2a",
-                    "dataFilter": {
-                        "timeRange": {
-                            "from": start_date.strftime('%Y-%m-%dT00:00:00Z'),
-                            "to": end_date.strftime('%Y-%m-%dT23:59:59Z')
-                        },
-                        "maxCloudCoverage": 30
-                    }
-                }]
-            },
-            "output": {
-                "resx": 10,
-                "resy": 10,
-                "responses": [{
-                    "identifier": "ndvi",
-                    "format": {"type": "application/json"}  # request JSON if supported
-                }]
-            },
-            "evalscript": evalscript
-        }
-
-        try:
-            resp = await self._session.post(process_url, headers=headers, json=payload, timeout=120)
-            if resp.status_code == 400:
-                # no data — расширяем период и пробуем снова (с ограничением)
-                new_days = min(days * 2, self._max_days)
-                if new_days == days:
-                    return {'success': False, 'error': 'No data found for the requested period'}
-                logger.warning("No data for %d days; trying %d days (attempt %d)", days, new_days, attempt + 1)
-                await asyncio.sleep(0.2)
-                return await self.get_ndvi(lat, lon, days=new_days, attempt=attempt + 1)
-
-            resp.raise_for_status()
-            j = resp.json()
-
-            # Попытка извлечь ndvi массив из ответа process API
-            ndvi_values = self._extract_ndvi_values_from_process_response(j)
-            if ndvi_values:
-                stats = self._compute_stats(ndvi_values)
-                stats['date_range'] = (start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'))
-                stats['status'] = self._interpret_ndvi(stats['mean'])
-                stats['success'] = True
-                return stats
-
-            # Если process не вернул валидных данных — пробуем статистический API как fallback
-            stats = await self._get_statistics(bbox, start_date, end_date, token)
-            if stats:
-                stats['status'] = self._interpret_ndvi(stats['mean'])
-                stats['success'] = True
-                return stats
-
-            return {'success': False, 'error': 'No NDVI data found or unable to parse response'}
-
-        except httpx.HTTPStatusError as e:
-            logger.error("HTTP error: %s %s", e.response.status_code, e.response.text)
-            return {'success': False, 'error': f'HTTP {e.response.status_code}'}
-        except Exception as e:
-            logger.exception("Unexpected error during NDVI request")
-            return {'success': False, 'error': str(e)}
-
-    def _extract_ndvi_values_from_process_response(self, resp_json: Dict) -> Optional[List[float]]:
-        """
-        Try multiple known patterns to extract NDVI numeric values from process API JSON response.
-        Returns flat list of values (masked values removed) or None.
-        """
-        try:
-            # Common pattern: response -> outputs -> ndvi -> data (2D array) OR features
-            # We will search recursively for arrays of numbers or nested arrays under keys containing 'ndvi'
-            def find_ndvi(obj):
-                if isinstance(obj, dict):
-                    for k, v in obj.items():
-                        if 'ndvi' in k.lower():
-                            yield v
-                        else:
-                            yield from find_ndvi(v)
-                elif isinstance(obj, list):
-                    for item in obj:
-                        yield from find_ndvi(item)
-
-            candidates = list(find_ndvi(resp_json))
-            for cand in candidates:
-                # cand could be dict with 'values' or direct arrays
-                if isinstance(cand, dict):
-                    # try common fields
-                    for fld in ('data', 'values', 'bands', 'array', 'ndvi'):
-                        if fld in cand and isinstance(cand[fld], list):
-                            flat = self._flatten_and_filter(cand[fld])
-                            if flat:
-                                return flat
-                elif isinstance(cand, list):
-                    flat = self._flatten_and_filter(cand)
-                    if flat:
-                        return flat
-            return None
-        except Exception as e:
-            logger.debug("extract_ndvi_values error: %s", e)
-            return None
-
-    def _flatten_and_filter(self, arr):
-        """Flatten nested lists and filter out non-finite or masked values (None, NaN, zeros masked)."""
-        flat = []
-        def walk(x):
-            if x is None:
-                return
-            if isinstance(x, list):
-                for el in x:
-                    walk(el)
-            else:
-                try:
-                    val = float(x)
-                    # exclude invalid / sentinel values (e.g. 0 with dataMask==0)
-                    if math.isfinite(val):
-                        flat.append(val)
-                except Exception:
-                    return
-        walk(arr)
-        # remove zeros if very likely masked (but keep zeros if real)
-        # Cannot perfectly know mask here -> keep all finite vals
-        return flat if flat else None
-
-    def _compute_stats(self, values: List[float]) -> Dict:
-        if not values:
-            return {'mean': 0.0, 'min': 0.0, 'max': 0.0, 'stdev': 0.0}
-        if np is not None:
-            a = np.array(values, dtype=float)
-            return {
-                'mean': float(a.mean()),
-                'min': float(a.min()),
-                'max': float(a.max()),
-                'stdev': float(a.std(ddof=0))
-            }
-        else:
-            # fallback minimal stats
-            n = len(values)
-            s = sum(values)
-            mean = s / n
-            var = sum((x - mean) ** 2 for x in values) / n
-            return {
-                'mean': mean,
-                'min': min(values),
-                'max': max(values),
-                'stdev': math.sqrt(var)
-            }
-
-    async def _get_statistics(self, bbox: list, start_date: datetime, end_date: datetime, token: str) -> Optional[Dict]:
-        """Fallback: call statistics endpoint and try to parse returned structure."""
-        url = f"{self.BASE_URL}/api/v1/statistics"
-        headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
-
-        evalscript = """
-        //VERSION=3
-        function setup() {
-            return { input: [{ bands: ["B04","B08","SCL"] }], output: [{ id: "ndvi", bands: 1 }] };
-        }
-        function evaluatePixel(sample) {
-            if (sample.SCL == 3 || sample.SCL == 8 || sample.SCL == 9 || sample.SCL == 10 || sample.SCL == 11) {
-                return [null];
-            }
-            let denom = (sample.B08 + sample.B04);
-            if (denom == 0.0) {
-                return [null];
-            }
-            return [(sample.B08 - sample.B04) / denom];
-        }
-        """
-
-        payload = {
-            "input": {
-                "bounds": {
-                    "bbox": bbox,
-                    "properties": {"crs": "EPSG:4326"}
-                },
-                "data": [{
-                    "type": "sentinel-2-l2a",
-                    "dataFilter": {
-                        "timeRange": {
-                            "from": start_date.strftime('%Y-%m-%dT00:00:00Z'),
-                            "to": end_date.strftime('%Y-%m-%dT23:59:59Z')
-                        },
-                        "maxCloudCoverage": 30
-                    }
-                }]
-            },
-            "aggregation": {
-                "timeRange": {
-                    "from": start_date.strftime('%Y-%m-%dT00:00:00Z'),
-                    "to": end_date.strftime('%Y-%m-%dT23:59:59Z')
-                },
-                "aggregationInterval": {"of": "P1D"},
-                "evalscript": evalscript,
-                "resx": 10,
-                "resy": 10
-            },
-            "calculations": {
-                "ndvi": {
-                    "statistics": {
-                        "default": {
-                            "percentiles": {"k": [25, 50, 75]}
+                "data": [
+                    {
+                        "type": "sentinel-2-l2a",
+                        "dataFilter": {
+                            "timeRange": {"from": from_date, "to": to_date}
                         }
                     }
-                }
+                ]
+            },
+            "evalscript": evalscript,
+            "output": {
+                "width": 64,
+                "height": 64,
+                "responses": [
+                    {"identifier": "ndvi", "format": {"type": "image/tiff"}}
+                ]
             }
         }
 
+        # Если у вас instance_id — добавить его
+        if self.instance_id:
+            payload["input"]["instanceId"] = self.instance_id
+
+        return payload
+
+    def get_ndvi(self, lon: float, lat: float, days: int = 30, size_meters: float = 50.0) -> Optional[np.ndarray]:
+        """
+        Получить NDVI как 2D numpy array (width x height) для bbox вокруг lon,lat.
+        При ошибке вернёт None и задокументирует причину в логах.
+        """
+        # Рanges
+        to_date = datetime.utcnow().date()
+        from_date = to_date - timedelta(days=days)
+        from_date_s = from_date.isoformat() + "T00:00:00Z"
+        to_date_s = (to_date + timedelta(days=1)).isoformat() + "T00:00:00Z"  # exclusive
+
+        bbox = self._make_bbox(lon, lat, size_meters=size_meters)
+        logger.info("Requesting Sentinel Hub NDVI for bbox %s and dates %s - %s", bbox, from_date_s, to_date_s)
+
+        payload = self._build_payload(bbox, from_date_s, to_date_s)
+
+        token = self._get_oauth_token()
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
         try:
-            resp = await self._session.post(url, headers=headers, json=payload, timeout=120)
-            resp.raise_for_status()
-            data = resp.json()
-            # Best-effort parsing: try to find mean/min/max/stdev in response
-            # Search recursively for 'mean' or 'stats'
-            def find_stats(obj):
-                if isinstance(obj, dict):
-                    if 'mean' in obj or 'min' in obj or 'max' in obj:
-                        return obj
-                    for v in obj.values():
-                        found = find_stats(v)
-                        if found:
-                            return found
-                elif isinstance(obj, list):
-                    for item in obj:
-                        found = find_stats(item)
-                        if found:
-                            return found
-                return None
-
-            stats_obj = find_stats(data)
-            if stats_obj:
-                mean = stats_obj.get('mean') or stats_obj.get('Mean') or stats_obj.get('average')
-                minv = stats_obj.get('min', 0.0)
-                maxv = stats_obj.get('max', 1.0)
-                stdev = stats_obj.get('std') or stats_obj.get('stdev') or stats_obj.get('stDev', 0.0)
-                date = None
-                # try to get last interval
-                if data.get('data') and isinstance(data['data'], list) and len(data['data']) > 0:
-                    latest = data['data'][-1]
-                    interval = latest.get('interval', {})
-                    date = interval.get('from', '')[:10] if interval else None
-                return {
-                    'mean': float(mean) if mean is not None else 0.0,
-                    'min': float(minv),
-                    'max': float(maxv),
-                    'stdev': float(stdev),
-                    'date': date
-                }
-            return None
+            r = self._http.post(self.PROCESS_URL, json=payload, headers=headers)
         except Exception as e:
-            logger.warning("Statistics API failed: %s", e)
+            logger.exception("HTTP request to Sentinel Hub failed")
             return None
 
-    def _interpret_ndvi(self, ndvi: float) -> str:
-        if ndvi >= 0.6:
-            return 'excellent'
-        if ndvi >= 0.4:
-            return 'good'
-        if ndvi >= 0.2:
-            return 'medium'
-        return 'bad'
+        if r.status_code == 400:
+            # Логируем тело запроса и ответ сервера — это пригодится при отладке
+            logger.error("Sentinel Hub returned 400 Bad Request. Response: %s", r.text)
+            logger.debug("Payload sent: %s", payload)
+            return None
+
+        if r.status_code != 200:
+            logger.error("Sentinel Hub returned status %s: %s", r.status_code, r.text)
+            return None
+
+        # Мы ожидаем GeoTIFF (image/tiff) — httpx вернёт байты
+        content_type = r.headers.get("Content-Type", "")
+        if "image/tiff" not in content_type and "application/octet-stream" not in content_type:
+            logger.warning("Unexpected content-type from Sentinel Hub: %s", content_type)
+
+        # Попытаться прочитать как TIFF в памяти — если пользователь не хочет rasterio, можно распарсить с помощью numpy
+        try:
+            # Читаем как array — используем rasterio, если доступен
+            try:
+                import rasterio
+                from rasterio.io import MemoryFile
+
+                with MemoryFile(r.content) as mem:
+                    with mem.open() as src:
+                        arr = src.read(1).astype(np.float32)
+                        # Sentinel Hub может возвращать значения, масштабированные в 0..1 или -1..1
+                        # Тут мы просто возвращаем массив как есть; пользователь может нормализовать
+                        logger.info("NDVI image read: shape=%s, dtype=%s", arr.shape, arr.dtype)
+                        return arr
+            except Exception:
+                # Fall back: try to parse raw bytes into numpy — подходит, если сервер вернул одиночный float32 raster
+                logger.debug("rasterio not available or failed, trying numpy fallback")
+                import tifffile
+                arr = tifffile.imread(r.content).astype(np.float32)
+                logger.info("NDVI image read via tifffile: shape=%s, dtype=%s", arr.shape, arr.dtype)
+                return arr
+        except Exception as e:
+            logger.exception("Failed to parse NDVI GeoTIFF: %s", e)
+            return None
+
+
+if __name__ == "__main__":
+    # Пример использования; не храните client_id/client_secret в коде в проде
+    logging.basicConfig(level=logging.INFO)
+    client_id = "SENTINEL_CLIENT_ID"
+    client_secret = "SENTINEL_CLIENT_SECRET"
+
+    ndvi = SentinelNDVI(client_id, client_secret)
+    try:
+        arr = ndvi.get_ndvi(69.245, 41.295, days=30, size_meters=80)
+        if arr is None:
+            logger.error("NDVI request failed")
+        else:
+            logger.info("NDVI array min/max: %s/%s", np.nanmin(arr), np.nanmax(arr))
+    finally:
+        ndvi.close()
