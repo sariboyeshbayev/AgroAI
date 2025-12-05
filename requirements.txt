@@ -15,7 +15,7 @@ Pillow==10.1.0
 numpy==1.26.2
 
 # Satellite Data (Planetary Computer - БЕЗ API КЛЮЧА!)
-planetary-computer==1.0.1
+planetary-computer==1.0.0
 pystac-client==0.7.5
 pystac==1.9.0
 
