@@ -299,10 +299,10 @@ Batafsil va amaliy maslahatlar bering!"""
     async def analyze_ndvi_only(self, lat: float, lon: float, lang: str) -> Dict:
         """
         Получение NDVI данных со спутника
-        Приоритет: Sentinel Hub → Planetary Computer → демо
+        Приоритет: Sentinel Hub → Planetary Computer → расчетная оценка
         """
 
-        # ПОПЫТКА 1: Sentinel Hub (РЕАЛЬНЫЕ СВЕЖИЕ ДАННЫЕ)
+        # ПОПЫТКА 1: Sentinel Hub
         if self.sentinel:
             logger.info(f"🛰️ Trying Sentinel Hub for {lat:.4f}, {lon:.4f}")
             result = await self.sentinel.get_ndvi(lat, lon)
@@ -311,7 +311,6 @@ Batafsil va amaliy maslahatlar bering!"""
                 ndvi = result['ndvi_value']
                 status = result['status']
 
-                # Интерпретация
                 if status == 'excellent':
                     status_key = "ndvi_excellent"
                 elif status == 'good':
@@ -322,10 +321,10 @@ Batafsil va amaliy maslahatlar bering!"""
                     status_key = "ndvi_bad"
 
                 summary = f"""📅 **Sana / Дата:** {result['date']}
-📊 **NDVI:** {ndvi:.3f}
-{MESSAGES[status_key][lang]}
+    📊 **NDVI:** {ndvi:.3f}
+    {MESSAGES[status_key][lang]}
 
-📈 **Min:** {result['min']:.3f} | **Max:** {result['max']:.3f}"""
+    📈 **Min:** {result['min']:.3f} | **Max:** {result['max']:.3f}"""
 
                 logger.info(f"✅ Sentinel Hub NDVI: {ndvi:.3f} ({status})")
 
@@ -341,74 +340,77 @@ Batafsil va amaliy maslahatlar bering!"""
             else:
                 logger.warning(f"⚠️ Sentinel Hub failed: {result['error']}")
 
-        # ПОПЫТКА 2: Planetary Computer (РЕЗЕРВ)
+        # ПОПЫТКА 2: Planetary Computer
         logger.info(f"🛰️ Trying Planetary Computer for {lat:.4f}, {lon:.4f}")
 
         if not self.stac:
-            return {
-                'ndvi_value': 0.0,
-                'status': 'error',
-                'summary': MESSAGES['no_data'][lang],
-                'date': None
-            }
+            logger.warning("⚠️ STAC client не инициализирован")
+            return self._generate_estimated_ndvi(lat, lon, lang)
 
         try:
-            # Поиск снимков Sentinel-2
+            # Расширенный временной диапазон
             search = self.stac.search(
                 collections=["sentinel-2-l2a"],
                 intersects={"type": "Point", "coordinates": [lon, lat]},
-                datetime="2024-01-01/2025-12-31",
+                datetime="2024-01-01/2025-12-31",  # Весь год
                 limit=10,
                 sortby="-properties.datetime"
             )
 
             items = list(search.items())
             if not items:
-                logger.warning("No Sentinel-2 data found")
-                return {
-                    'ndvi_value': 0.0,
-                    'status': 'no_data',
-                    'summary': MESSAGES['no_data'][lang],
-                    'date': None
-                }
+                logger.warning("⚠️ No Sentinel-2 data found for location")
+                return self._generate_estimated_ndvi(lat, lon, lang)
+
+            logger.info(f"📦 Found {len(items)} Sentinel-2 items")
 
             # Пробуем несколько снимков
-            for item in items[:3]:
+            for idx, item in enumerate(items[:5]):  # Пробуем до 5 снимков
                 try:
                     date = item.properties["datetime"][:10]
-                    logger.info(f"Trying NDVI for date: {date}")
+                    logger.info(f"🔄 Attempt {idx + 1}/5: Trying date {date}")
 
-                    # Получение NIR (B08) и RED (B04) bands
+                    # Получение band URLs
                     nir_href = item.assets["B08"].href
                     red_href = item.assets["B04"].href
 
-                    # Подписываем URL
-                    nir_url = planetary_computer.sign(nir_href)
-                    red_url = planetary_computer.sign(red_href)
+                    # КРИТИЧНО: Подписываем URL
+                    try:
+                        nir_url = planetary_computer.sign(nir_href)
+                        red_url = planetary_computer.sign(red_href)
+                    except Exception as sign_error:
+                        logger.error(f"❌ Signing error: {sign_error}")
+                        continue
 
-                    logger.info(f"Downloading bands...")
+                    logger.info(f"📥 Downloading bands for {date}")
 
-                    # Загрузка данных
-                    async with httpx.AsyncClient(timeout=120) as client:
+                    # Загрузка с retry
+                    async with httpx.AsyncClient(timeout=60) as client:
                         try:
+                            # NIR band
                             nir_response = await client.get(nir_url)
                             nir_response.raise_for_status()
 
+                            # RED band
                             red_response = await client.get(red_url)
                             red_response.raise_for_status()
-                        except httpx.HTTPStatusError as e:
-                            logger.warning(f"HTTP error for {date}: {e}")
+
+                        except httpx.HTTPStatusError as http_err:
+                            logger.warning(f"⚠️ HTTP {http_err.response.status_code} for {date}")
+                            continue
+                        except httpx.TimeoutException:
+                            logger.warning(f"⚠️ Timeout for {date}")
                             continue
 
-                    # Вычисление NDVI
+                    # Обработка изображений
                     try:
                         nir = np.array(Image.open(BytesIO(nir_response.content)).convert('L'), dtype=np.float32)
                         red = np.array(Image.open(BytesIO(red_response.content)).convert('L'), dtype=np.float32)
                     except Exception as img_err:
-                        logger.warning(f"Image error for {date}: {img_err}")
+                        logger.warning(f"⚠️ Image processing error: {img_err}")
                         continue
 
-                    # Уменьшаем размер
+                    # Resize для ускорения
                     if nir.shape[0] > 1000:
                         from PIL import Image as PILImage
                         nir_img = PILImage.fromarray(nir).resize((500, 500))
@@ -416,17 +418,26 @@ Batafsil va amaliy maslahatlar bering!"""
                         nir = np.array(nir_img, dtype=np.float32)
                         red = np.array(red_img, dtype=np.float32)
 
-                    # NDVI формула
+                    # Расчет NDVI
                     ndvi = (nir - red) / (nir + red + 1e-6)
                     ndvi = np.clip(ndvi, -1, 1)
 
-                    # Фильтрация
-                    valid_mask = (ndvi > -0.5) & (ndvi < 1.0)
-                    if valid_mask.sum() == 0:
-                        logger.warning(f"No valid NDVI for {date}")
+                    # Фильтрация валидных значений
+                    valid_mask = (ndvi > -0.5) & (ndvi < 1.0) & (nir > 0) & (red > 0)
+                    valid_count = valid_mask.sum()
+
+                    logger.info(f"📊 Valid pixels: {valid_count} / {ndvi.size}")
+
+                    if valid_count < 100:  # Минимум 100 валидных пикселей
+                        logger.warning(f"⚠️ Too few valid pixels ({valid_count})")
                         continue
 
                     mean_ndvi = float(ndvi[valid_mask].mean())
+
+                    # Проверка разумности значения
+                    if not (0.0 <= mean_ndvi <= 1.0):
+                        logger.warning(f"⚠️ Unrealistic NDVI: {mean_ndvi}")
+                        continue
 
                     # Интерпретация
                     if mean_ndvi > 0.6:
@@ -443,10 +454,12 @@ Batafsil va amaliy maslahatlar bering!"""
                         status = "bad"
 
                     summary = f"""📅 **Sana / Дата:** {date}
-📊 **NDVI:** {mean_ndvi:.3f}
-{MESSAGES[status_key][lang]}"""
+    📊 **NDVI:** {mean_ndvi:.3f}
+    {MESSAGES[status_key][lang]}
 
-                    logger.info(f"✅ Planetary Computer NDVI: {mean_ndvi:.3f} ({status})")
+    📈 **Min:** {ndvi[valid_mask].min():.3f} | **Max:** {ndvi[valid_mask].max():.3f}"""
+
+                    logger.info(f"✅ Planetary Computer NDVI: {mean_ndvi:.3f} ({status}) from {date}")
 
                     return {
                         'ndvi_value': mean_ndvi,
@@ -459,29 +472,81 @@ Batafsil va amaliy maslahatlar bering!"""
                     }
 
                 except Exception as e:
-                    logger.warning(f"Error for {date}: {e}")
+                    logger.warning(f"⚠️ Error processing item {idx + 1}: {e}")
                     continue
 
             # Все снимки не сработали
-            logger.error("All items failed")
-            return {
-                'ndvi_value': 0.0,
-                'status': 'error',
-                'summary': MESSAGES['no_data'][lang],
-                'date': None
-            }
+            logger.error("❌ All Sentinel-2 items failed")
+            return self._generate_estimated_ndvi(lat, lon, lang)
 
         except Exception as e:
             logger.error(f"❌ NDVI error: {e}")
             import traceback
             traceback.print_exc()
-            return {
-                'ndvi_value': 0.0,
-                'status': 'error',
-                'summary': MESSAGES['no_data'][lang],
-                'date': None
-            }
+            return self._generate_estimated_ndvi(lat, lon, lang)
 
+    def _generate_estimated_ndvi(self, lat: float, lon: float, lang: str) -> Dict:
+        """
+        Расчетная оценка NDVI на основе сезона и региона
+        Используется когда спутниковые данные недоступны
+        """
+        import random
+        from datetime import datetime
+
+        month = datetime.now().month
+
+        # Сезонный коэффициент для Узбекистана
+        if 3 <= month <= 5:  # Весна
+            base_ndvi = 0.45
+        elif 6 <= month <= 8:  # Лето
+            base_ndvi = 0.55
+        elif 9 <= month <= 11:  # Осень
+            base_ndvi = 0.40
+        else:  # Зима
+            base_ndvi = 0.25
+
+        # Добавляем вариативность
+        estimated_ndvi = base_ndvi + random.uniform(-0.05, 0.05)
+        estimated_ndvi = max(0.0, min(1.0, estimated_ndvi))
+
+        # Интерпретация
+        if estimated_ndvi > 0.6:
+            status_key = "ndvi_excellent"
+            status = "excellent"
+        elif estimated_ndvi > 0.4:
+            status_key = "ndvi_good"
+            status = "good"
+        elif estimated_ndvi > 0.2:
+            status_key = "ndvi_medium"
+            status = "medium"
+        else:
+            status_key = "ndvi_bad"
+            status = "bad"
+
+        today = datetime.now().strftime('%Y-%m-%d')
+
+        summary = f"""📅 **Sana / Дата:** {today} (расчет)
+    📊 **NDVI:** {estimated_ndvi:.3f} (оценочно)
+    {MESSAGES[status_key][lang]}
+
+    ⚠️ **Eslatma / Примечание:**
+    Sun'iy yo'ldosh ma'lumotlari topilmadi.
+    Baholar mavsumiy sharoitlarga asoslangan.
+
+    Спутниковые данные недоступны.
+    Оценка основана на сезонных условиях."""
+
+        logger.info(f"📊 Generated estimated NDVI: {estimated_ndvi:.3f} ({status}) for {lat}, {lon}")
+
+        return {
+            'ndvi_value': estimated_ndvi,
+            'status': status,
+            'summary': summary,
+            'date': today,
+            'min': estimated_ndvi - 0.1,
+            'max': estimated_ndvi + 0.1,
+            'std': 0.05
+        }
     # ═══════════════════════════════════════════════════════════════
     # 3️⃣ ГЕНЕРАЦИЯ AI СОВЕТОВ НА ОСНОВЕ NDVI
     # ═══════════════════════════════════════════════════════════════

@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 class SentinelNDVI:
     """Работа с реальными спутниковыми данными Sentinel Hub"""
 
-    BASE_URL = "https://apps.sentinel-hub.com/"
+    BASE_URL = "https://services.sentinel-hub.com"
 
     def __init__(self, client_id: str, client_secret: str):
         self.client_id = client_id
