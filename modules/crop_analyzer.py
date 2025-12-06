@@ -296,10 +296,12 @@ Batafsil va amaliy maslahatlar bering!"""
     # 2️⃣ NDVI АНАЛИЗ (СНАЧАЛА SENTINEL HUB, ПОТОМ PLANETARY COMPUTER)
     # ═══════════════════════════════════════════════════════════════
 
+    # Замените метод analyze_ndvi_only в вашем crop_analyzer.py на эту версию:
+
     async def analyze_ndvi_only(self, lat: float, lon: float, lang: str) -> Dict:
         """
         Получение NDVI данных со спутника
-        Приоритет: Sentinel Hub → Planetary Computer → расчетная оценка
+        ИСПРАВЛЕНО: улучшена обработка Planetary Computer
         """
 
         # ПОПЫТКА 1: Sentinel Hub
@@ -340,7 +342,7 @@ Batafsil va amaliy maslahatlar bering!"""
             else:
                 logger.warning(f"⚠️ Sentinel Hub failed: {result['error']}")
 
-        # ПОПЫТКА 2: Planetary Computer
+        # ПОПЫТКА 2: Planetary Computer (с исправлением)
         logger.info(f"🛰️ Trying Planetary Computer for {lat:.4f}, {lon:.4f}")
 
         if not self.stac:
@@ -352,7 +354,7 @@ Batafsil va amaliy maslahatlar bering!"""
             search = self.stac.search(
                 collections=["sentinel-2-l2a"],
                 intersects={"type": "Point", "coordinates": [lon, lat]},
-                datetime="2024-01-01/2025-12-31",  # Весь год
+                datetime="2024-01-01/2025-12-31",
                 limit=10,
                 sortby="-properties.datetime"
             )
@@ -365,7 +367,7 @@ Batafsil va amaliy maslahatlar bering!"""
             logger.info(f"📦 Found {len(items)} Sentinel-2 items")
 
             # Пробуем несколько снимков
-            for idx, item in enumerate(items[:5]):  # Пробуем до 5 снимков
+            for idx, item in enumerate(items[:5]):
                 try:
                     date = item.properties["datetime"][:10]
                     logger.info(f"🔄 Attempt {idx + 1}/5: Trying date {date}")
@@ -374,18 +376,23 @@ Batafsil va amaliy maslahatlar bering!"""
                     nir_href = item.assets["B08"].href
                     red_href = item.assets["B04"].href
 
-                    # КРИТИЧНО: Подписываем URL
+                    # КРИТИЧНО: Подписываем URL ПРАВИЛЬНО
                     try:
-                        nir_url = planetary_computer.sign(nir_href)
-                        red_url = planetary_computer.sign(red_href)
+                        # Используем правильный метод подписи
+                        import planetary_computer as pc
+                        signed_item = pc.sign(item)
+                        nir_url = signed_item.assets["B08"].href
+                        red_url = signed_item.assets["B04"].href
                     except Exception as sign_error:
                         logger.error(f"❌ Signing error: {sign_error}")
-                        continue
+                        # Пробуем без подписи (может работать для старых данных)
+                        nir_url = nir_href
+                        red_url = red_href
 
                     logger.info(f"📥 Downloading bands for {date}")
 
-                    # Загрузка с retry
-                    async with httpx.AsyncClient(timeout=60) as client:
+                    # Загрузка с увеличенным timeout
+                    async with httpx.AsyncClient(timeout=90, follow_redirects=True) as client:
                         try:
                             # NIR band
                             nir_response = await client.get(nir_url)
@@ -396,7 +403,8 @@ Batafsil va amaliy maslahatlar bering!"""
                             red_response.raise_for_status()
 
                         except httpx.HTTPStatusError as http_err:
-                            logger.warning(f"⚠️ HTTP {http_err.response.status_code} for {date}")
+                            logger.warning(
+                                f"⚠️ HTTP {http_err.response.status_code} for {date}: {http_err.response.text[:200]}")
                             continue
                         except httpx.TimeoutException:
                             logger.warning(f"⚠️ Timeout for {date}")
@@ -428,7 +436,7 @@ Batafsil va amaliy maslahatlar bering!"""
 
                     logger.info(f"📊 Valid pixels: {valid_count} / {ndvi.size}")
 
-                    if valid_count < 100:  # Минимум 100 валидных пикселей
+                    if valid_count < 100:
                         logger.warning(f"⚠️ Too few valid pixels ({valid_count})")
                         continue
 
@@ -473,6 +481,8 @@ Batafsil va amaliy maslahatlar bering!"""
 
                 except Exception as e:
                     logger.warning(f"⚠️ Error processing item {idx + 1}: {e}")
+                    import traceback
+                    traceback.print_exc()
                     continue
 
             # Все снимки не сработали
