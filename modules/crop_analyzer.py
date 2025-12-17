@@ -233,7 +233,7 @@ Batafsil va amaliy maslahatlar bering!"""
                 text += f"""🦠 **Kasallik:** {ai_result['disease_name']}
 
 📋 **Alomatlar:**
-{ai_result.get('symptoms', 'Ma\'lumot yo\'q')}
+{ai_result.get('symptoms', 'Ma`lumot yo`q')}
 
 🔍 **Sabablari:**
 {ai_result.get('causes', 'Aniqlanmadi')}
@@ -298,16 +298,16 @@ Batafsil va amaliy maslahatlar bering!"""
 
     # Замените метод analyze_ndvi_only в вашем crop_analyzer.py на эту версию:
 
-    async def analyze_ndvi_only(self, lat: float, lon: float, lang: str) -> Dict:
+    async def analyze_ndvi_only(self, lat: float, lon: float, lang: str, bbox: list = None) -> Dict:
         """
         Получение NDVI данных со спутника
-        ИСПРАВЛЕНО: улучшена обработка Planetary Computer
+        ИСПРАВЛЕНО: улучшена обработка Planetary Computer и добавлен BBOX
         """
 
         # ПОПЫТКА 1: Sentinel Hub
         if self.sentinel:
-            logger.info(f"🛰️ Trying Sentinel Hub for {lat:.4f}, {lon:.4f}")
-            result = await self.sentinel.get_ndvi(lat, lon)
+            logger.info(f"🛰️ Trying Sentinel Hub for {lat:.4f}, {lon:.4f} (BBox: {bbox})")
+            result = await self.sentinel.get_ndvi(lat, lon, bbox=bbox)
 
             if result['success']:
                 ndvi = result['ndvi_value']
@@ -347,7 +347,8 @@ Batafsil va amaliy maslahatlar bering!"""
 
         if not self.stac:
             logger.warning("⚠️ STAC client не инициализирован")
-            return self._generate_estimated_ndvi(lat, lon, lang)
+            logger.warning("⚠️ STAC client не инициализирован")
+            return await self._generate_estimated_ndvi(lat, lon, lang)
 
         try:
             # Расширенный временной диапазон
@@ -362,7 +363,9 @@ Batafsil va amaliy maslahatlar bering!"""
             items = list(search.items())
             if not items:
                 logger.warning("⚠️ No Sentinel-2 data found for location")
-                return self._generate_estimated_ndvi(lat, lon, lang)
+            if not items:
+                logger.warning("⚠️ No Sentinel-2 data found for location")
+                return await self._generate_estimated_ndvi(lat, lon, lang)
 
             logger.info(f"📦 Found {len(items)} Sentinel-2 items")
 
@@ -487,15 +490,17 @@ Batafsil va amaliy maslahatlar bering!"""
 
             # Все снимки не сработали
             logger.error("❌ All Sentinel-2 items failed")
-            return self._generate_estimated_ndvi(lat, lon, lang)
+            # Все снимки не сработали
+            logger.error("❌ All Sentinel-2 items failed")
+            return await self._generate_estimated_ndvi(lat, lon, lang)
 
         except Exception as e:
             logger.error(f"❌ NDVI error: {e}")
             import traceback
             traceback.print_exc()
-            return self._generate_estimated_ndvi(lat, lon, lang)
+            return await self._generate_estimated_ndvi(lat, lon, lang)
 
-    def _generate_estimated_ndvi(self, lat: float, lon: float, lang: str) -> Dict:
+    async def _generate_estimated_ndvi(self, lat: float, lon: float, lang: str) -> Dict:
         """
         Расчетная оценка NDVI на основе сезона и региона
         Используется когда спутниковые данные недоступны
@@ -505,18 +510,66 @@ Batafsil va amaliy maslahatlar bering!"""
 
         month = datetime.now().month
 
-        # Сезонный коэффициент для Узбекистана
-        if 3 <= month <= 5:  # Весна
-            base_ndvi = 0.45
-        elif 6 <= month <= 8:  # Лето
-            base_ndvi = 0.55
-        elif 9 <= month <= 11:  # Осень
-            base_ndvi = 0.40
-        else:  # Зима
-            base_ndvi = 0.25
+        # SMART FALLBACK: Используем реальную погоду для оценки
+        logger.info(f"🌦 Using Smart Weather Fallback for {lat}, {lon}")
+        
+        try:
+            url = "https://archive-api.open-meteo.com/v1/archive"
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=30)
+            
+            params = {
+                "latitude": lat,
+                "longitude": lon,
+                "start_date": start_date.strftime("%Y-%m-%d"),
+                "end_date": end_date.strftime("%Y-%m-%d"),
+                "daily": "temperature_2m_max,precipitation_sum"
+            }
+            
+            async with httpx.AsyncClient() as client:
+                r = await client.get(url, params=params)
+                if r.status_code == 200:
+                    data = r.json()
+                    temps = data['daily']['temperature_2m_max']
+                    precip = data['daily']['precipitation_sum']
+                    
+                    avg_temp = sum(temps) / len(temps)
+                    total_rain = sum(precip)
+                    
+                    # Логика оценки здоровья
+                    # Хороший дождь (>10мм) и тепло (20-30) = Хорошо
+                    # Жара (>35) и нет дождя = Плохо
+                    
+                    if total_rain > 20 and 15 <= avg_temp <= 32:
+                        base_ndvi = 0.55  # Good
+                        status = "good"
+                    elif total_rain > 5 and 10 <= avg_temp <= 35:
+                        base_ndvi = 0.45  # Normal
+                        status = "medium"
+                    elif avg_temp > 35 and total_rain < 2:
+                        base_ndvi = 0.15  # Drought
+                        status = "bad"
+                    else:
+                        base_ndvi = 0.35  # Moderate
+                        status = "medium"
+                        
+                    estimated_ndvi = base_ndvi + random.uniform(-0.05, 0.05)
+                    weather_note = f"(Rain: {total_rain:.1f}mm, Temp: {avg_temp:.1f}C)"
+                    
+                else:
+                    raise Exception("Weather API failed")
+                    
+        except Exception as e:
+            logger.warning(f"⚠️ Smart Fallback failed: {e}")
+            # Fallback to simple season logic
+            weather_note = "(Seasonal Estimate)"
+            if 3 <= month <= 5: base_ndvi = 0.45
+            elif 6 <= month <= 8: base_ndvi = 0.55
+            elif 9 <= month <= 11: base_ndvi = 0.40
+            else: base_ndvi = 0.25
+            estimated_ndvi = base_ndvi + random.uniform(-0.05, 0.05)
+            status = "medium"
 
-        # Добавляем вариативность
-        estimated_ndvi = base_ndvi + random.uniform(-0.05, 0.05)
         estimated_ndvi = max(0.0, min(1.0, estimated_ndvi))
 
         # Интерпретация
@@ -535,16 +588,19 @@ Batafsil va amaliy maslahatlar bering!"""
 
         today = datetime.now().strftime('%Y-%m-%d')
 
-        summary = f"""📅 **Sana / Дата:** {today} (расчет)
-    📊 **NDVI:** {estimated_ndvi:.3f} (оценочно)
+        summary = f"""📅 **Sana / Дата:** {today}
+    📊 **NDVI:** {estimated_ndvi:.3f} (Smart Estimate)
     {MESSAGES[status_key][lang]}
+    
+    🌤 **Ob-havo tahlili / Анализ погоды:**
+    {weather_note}
 
     ⚠️ **Eslatma / Примечание:**
-    Sun'iy yo'ldosh ma'lumotlari topilmadi.
-    Baholar mavsumiy sharoitlarga asoslangan.
+    Sun'iy yo'ldosh ma'lumotlari mavjud emas.
+    Baho oxirgi 30 kunlik ob-havoga asoslangan.
 
     Спутниковые данные недоступны.
-    Оценка основана на сезонных условиях."""
+    Оценка основана на погоде за 30 дней."""
 
         logger.info(f"📊 Generated estimated NDVI: {estimated_ndvi:.3f} ({status}) for {lat}, {lon}")
 

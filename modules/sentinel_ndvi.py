@@ -46,17 +46,21 @@ class SentinelNDVI:
             logger.error(f"❌ Token error: {e}")
             return None
 
-    async def get_ndvi(self, lat: float, lon: float, days: int = 30, retries: int = 3) -> Dict:
+    async def get_ndvi(self, lat: float, lon: float, days: int = 30, retries: int = 3, bbox: list = None) -> Dict:
         """
         Получение реального NDVI со спутника Sentinel-2
-        ИСПРАВЛЕНО: используем image/tiff вместо application/json
         """
         token = await self.get_access_token()
         if not token:
             return {'success': False, 'error': 'Не удалось авторизоваться'}
 
-        offset = 0.0045  # ~500 метров
-        bbox = [lon - offset, lat - offset, lon + offset, lat + offset]
+        if bbox:
+            # Если передан полигон (bbox)
+            pass
+        else:
+            # Иначе создаем маленький бокс вокруг точки
+            offset = 0.0045  # ~500 метров
+            bbox = [lon - offset, lat - offset, lon + offset, lat + offset]
 
         end_date = datetime.now()
         start_date = end_date - timedelta(days=days)

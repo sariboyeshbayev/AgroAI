@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 # Тексты интерфейса
 TEXTS = {
     'uz': {
-        'welcome': "🌾 AgroAI ga xush kelibsiz!\n\nQishloq xo'jalik uchun AI yordamchisi.",
+        'welcome': "🌾 AgroAI ga xush kelibsiz!\n\nQishloq xo'jaligi uchun AI yordamchisi.",
         'menu': "📱 Asosiy menyu:",
 
         # Главные кнопки
@@ -243,6 +243,9 @@ class AgroAIBot:
 
         elif state == 'awaiting_credit':
             await self.process_credit_data(update, context, user_id, text)
+            
+        elif state == 'awaiting_advice_question':
+             await self.process_advice_question(update, context, user_id, text)
 
     # ═══════════════════════════════════════════════════════════════
     # 1️⃣ АНАЛИЗ РАСТЕНИЯ (ФОТО → CLAUDE VISION → РЕКОМЕНДАЦИИ)
@@ -341,10 +344,18 @@ class AgroAIBot:
             if len(coords) == 2:
                 # Одна точка
                 lat, lon = coords[0], coords[1]
+                bbox = None
             elif len(coords) == 4:
-                # Ограничивающий прямоугольник - берем центр
-                lat = (coords[0] + coords[2]) / 2
-                lon = (coords[1] + coords[3]) / 2
+                # Ограничивающий прямоугольник (BBOX)
+                # Format: min_lat, min_lon, max_lat, max_lon OR lat1, lon1, lat2, lon2
+                # We normalize to standard bbox: [min_lon, min_lat, max_lon, max_lat]
+                lats = [coords[0], coords[2]]
+                lons = [coords[1], coords[3]]
+                lat = sum(lats) / 2
+                lon = sum(lons) / 2
+                
+                bbox = [min(lons), min(lats), max(lons), max(lats)]
+                logger.info(f"📍 Polygon detected: {bbox}")
             else:
                 raise ValueError("Invalid format")
 
@@ -363,7 +374,8 @@ class AgroAIBot:
             ndvi_result = await self.crop_analyzer.analyze_ndvi_only(
                 lat=lat,
                 lon=lon,
-                lang=lang
+                lang=lang,
+                bbox=bbox
             )
 
             await msg.edit_text(self.get_text(user_id, 'generating_advice'))
@@ -502,9 +514,32 @@ class AgroAIBot:
             [InlineKeyboardButton(TEXTS[lang]['weather'], callback_data="advice_weather")]
         ]
         await update.message.reply_text(
-            self.get_text(user_id, 'choose_category'),
+            self.get_text(user_id, 'choose_category') + "\n\n⌨️ Yoki savolingizni yozing / Или напишите свой вопрос:",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
+        # Устанавливаем состояние ожидания вопроса
+        self.db.set_user_state(user_id, 'awaiting_advice_question')
+
+    async def process_advice_question(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, text: str):
+        """Обработка свободного вопроса AI"""
+        lang = self.db.get_user_language(user_id)
+        
+        msg = await update.message.reply_text("🤖..." if lang == 'ru' else "🤖...")
+        
+        try:
+            advice = await self.ai_advisor.get_advice("crops", lang, custom_question=text)
+            await msg.delete()
+            
+            await update.message.reply_text(
+                f"🤖 **AI Javob / Ответ:**\n\n{advice}",
+                parse_mode='Markdown',
+                reply_markup=self.get_main_keyboard(user_id)
+            )
+            self.db.set_user_state(user_id, None)
+            
+        except Exception as e:
+            logger.error(f"AI Q&A error: {e}")
+            await msg.edit_text("Error")
 
     async def advice_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработка запроса советов"""
