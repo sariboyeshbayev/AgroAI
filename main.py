@@ -346,16 +346,28 @@ class AgroAIBot:
                 lat, lon = coords[0], coords[1]
                 bbox = None
             elif len(coords) == 4:
-                # Ограничивающий прямоугольник (BBOX)
-                # Format: min_lat, min_lon, max_lat, max_lon OR lat1, lon1, lat2, lon2
-                # We normalize to standard bbox: [min_lon, min_lat, max_lon, max_lat]
+                # Ограничивающий прямоугольник (BBOX) или две точки? 
+                # Предполагаем bbox: min_lat, min_lon, max_lat, max_lon
+                # Нормаизуем
                 lats = [coords[0], coords[2]]
                 lons = [coords[1], coords[3]]
                 lat = sum(lats) / 2
                 lon = sum(lons) / 2
-                
                 bbox = [min(lons), min(lats), max(lons), max(lats)]
-                logger.info(f"📍 Polygon detected: {bbox}")
+                logger.info(f"📍 BBox detected: {bbox}")
+            elif len(coords) >= 6 and len(coords) % 2 == 0:
+                # Полигон (3+ точки)
+                # Извлекаем lats и lons
+                lats = coords[0::2]
+                lons = coords[1::2]
+                
+                # Центр
+                lat = sum(lats) / len(lats)
+                lon = sum(lons) / len(lons)
+                
+                # BBox из всех точек
+                bbox = [min(lons), min(lats), max(lons), max(lats)]
+                logger.info(f"📍 Polygon detected ({len(lats)} points). BBox: {bbox}")
             else:
                 raise ValueError("Invalid format")
 
